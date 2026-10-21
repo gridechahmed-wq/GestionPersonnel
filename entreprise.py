@@ -1,12 +1,14 @@
 import sqlite3
 import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import ttk
 
 
 # =====================================================================
 # ÉTAPE 1 : MODÈLES MÉTIER (héritage, composition, agrégation)
 # =====================================================================
 class Contrat:
-    """COMPOSITION : le contrat n'existe que pour un employé."""
+    """COMPOSITION : le contrat n'existe que pour un employé"""
 
     def __init__(self, type_contrat, montant, jours_travailles=0):
         self.type_contrat = type_contrat
@@ -15,7 +17,7 @@ class Contrat:
 
 
 class Adresse:
-    """COMPOSITION : l'adresse est créée par l'employé et disparaît avec lui."""
+    """COMPOSITION : l'adresse est créée par l'employé et disparaît avec lui """
 
     def __init__(self, rue="", ville=""):
         self.rue = rue
@@ -161,11 +163,12 @@ TRIS_SQL = {
     "nom": ("e.nom COLLATE NOCASE", "e.prenom COLLATE NOCASE"),
     "prenom": ("e.prenom COLLATE NOCASE", "e.nom COLLATE NOCASE"),
     "email": ("e.email COLLATE NOCASE",),
-    "statut": ("c.type_contrat",),
+    "statut": ("e.type_contrat",),
     "dept": ("d.nom COLLATE NOCASE",),
-    "ville": ("a.ville COLLATE NOCASE",),
+    "rue": ("e.rue COLLATE NOCASE",),
+    "ville": ("e.ville COLLATE NOCASE",),
     "projets": ("(SELECT COUNT(*) FROM affectations x WHERE x.employe_id = e.id)",),
-    "revenu": ("c.revenu_mensuel",),
+    "revenu": ("e.revenu_mensuel",),
 }
 
 
@@ -186,29 +189,15 @@ CREATE TABLE IF NOT EXISTS employes
     nom            TEXT NOT NULL,
     prenom         TEXT NOT NULL,
     email          TEXT NOT NULL UNIQUE,
+    rue            TEXT NOT NULL DEFAULT '',
+    ville          TEXT NOT NULL DEFAULT '',
+    type_contrat   TEXT NOT NULL DEFAULT 'Salarié',
+    montant        REAL NOT NULL DEFAULT 0 CHECK (montant >= 0),
+    jours_travailles INTEGER NOT NULL DEFAULT 0,
+    revenu_mensuel REAL NOT NULL DEFAULT 0,
     departement_id INTEGER,
     FOREIGN KEY (departement_id) REFERENCES departements (id)
         ON DELETE SET NULL
-);
-CREATE TABLE IF NOT EXISTS contrats
-(
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    employe_id       INTEGER NOT NULL UNIQUE,
-    type_contrat     TEXT    NOT NULL,
-    montant          REAL    NOT NULL CHECK (montant >= 0),
-    revenu_mensuel   REAL    NOT NULL,
-    jours_travailles INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (employe_id) REFERENCES employes (id)
-        ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS adresses
-(
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    employe_id INTEGER NOT NULL UNIQUE,
-    rue        TEXT    NOT NULL DEFAULT '',
-    ville      TEXT    NOT NULL DEFAULT '',
-    FOREIGN KEY (employe_id) REFERENCES employes (id)
-        ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS affectations
 (
@@ -238,11 +227,43 @@ class Depot:
         try:
             conn = self._connexion()
             conn.executescript(SCHEMA)
+            self._migrer_anciennes_tables(conn)
             conn.commit()
         finally:
             if conn:
                 conn.close()
 
+    @staticmethod
+    def _migrer_anciennes_tables(conn):
+
+        colonnes = {c[1] for c in conn.execute("PRAGMA table_info(employes)")}
+        ajouts = {
+            "rue": "TEXT NOT NULL DEFAULT ''",
+            "ville": "TEXT NOT NULL DEFAULT ''",
+            "type_contrat": "TEXT NOT NULL DEFAULT 'Salarié'",
+            "montant": "REAL NOT NULL DEFAULT 0",
+            "jours_travailles": "INTEGER NOT NULL DEFAULT 0",
+            "revenu_mensuel": "REAL NOT NULL DEFAULT 0",
+        }
+        for col, definition in ajouts.items():
+            if col not in colonnes:
+                conn.execute(f"ALTER TABLE employes ADD COLUMN {col} {definition}")
+
+        def existe(table):
+            return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                                "AND name = ?", (table,)).fetchone() is not None
+
+        def copier(table, champs):
+            affectations = ", ".join(
+                f"{c} = COALESCE((SELECT t.{c} FROM {table} t "
+                f"WHERE t.employe_id = employes.id), {c})" for c in champs)
+            conn.execute(f"UPDATE employes SET {affectations}")
+            conn.execute(f"DROP TABLE {table}")
+
+        if existe("adresses"):
+            copier("adresses", ("rue", "ville"))
+        if existe("contrats"):
+            copier("contrats", ("type_contrat", "montant", "jours_travailles","revenu_mensuel"))
 
     def _ecrire(self, sql, params=(), message_doublon="Valeur déjà existante."):
         conn = None
@@ -302,22 +323,19 @@ class Depot:
         return ValueError(f"Donnée refusée par la base : {e}")
 
     def ajouter_employe(self, employe, id_dept):
+        contrat = employe.contrat
         conn = None
         try:
             conn = self._connexion()
             curseur = conn.execute(
-                "INSERT INTO employes (nom, prenom, email, departement_id) VALUES (?, ?, ?, ?)",
-                (employe.nom, employe.prenom, employe.email, id_dept))
+                "INSERT INTO employes (nom, prenom, email, rue, ville, type_contrat, "
+                "montant, jours_travailles, revenu_mensuel, departement_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (employe.nom, employe.prenom, employe.email,
+                 employe.adresse.rue, employe.adresse.ville, contrat.type_contrat,
+                 contrat.montant, contrat.jours_travailles, employe.revenu_mensuel,
+                 id_dept))
             id_emp = curseur.lastrowid
-            contrat = employe.contrat
-            conn.execute(
-                "INSERT INTO contrats (employe_id, type_contrat, montant, "
-                "jours_travailles, revenu_mensuel) VALUES (?, ?, ?, ?, ?)",
-                (id_emp, contrat.type_contrat, contrat.montant,
-                 contrat.jours_travailles, employe.revenu_mensuel))
-            conn.execute(
-                "INSERT INTO adresses (employe_id, rue, ville) VALUES (?, ?, ?)",
-                (id_emp, employe.adresse.rue, employe.adresse.ville))
             conn.executemany(
                 "INSERT INTO affectations (employe_id, projet_id) VALUES (?, ?)",
                 [(id_emp, p.id_projet) for p in employe.projets])
@@ -329,23 +347,20 @@ class Depot:
                 conn.close()
 
     def modifier_employe(self, employe, id_dept):
+        contrat = employe.contrat
         conn = None
         try:
             conn = self._connexion()
             curseur = conn.execute(
-                "UPDATE employes SET nom = ?, prenom = ?, email = ?, departement_id = ? "
-                "WHERE id = ?",
-                (employe.nom, employe.prenom, employe.email, id_dept, employe.id_emp))
+                "UPDATE employes SET nom = ?, prenom = ?, email = ?, rue = ?, ville = ?, "
+                "type_contrat = ?, montant = ?, jours_travailles = ?, revenu_mensuel = ?, "
+                "departement_id = ? WHERE id = ?",
+                (employe.nom, employe.prenom, employe.email, employe.adresse.rue,
+                 employe.adresse.ville, contrat.type_contrat, contrat.montant,
+                 contrat.jours_travailles, employe.revenu_mensuel, id_dept,
+                 employe.id_emp))
             if curseur.rowcount == 0:
                 raise ValueError("Cet employé n'existe plus.")
-            contrat = employe.contrat
-            conn.execute(
-                "UPDATE contrats SET type_contrat = ?, montant = ?, jours_travailles = ?, revenu_mensuel = ? WHERE employe_id = ?",
-                (contrat.type_contrat, contrat.montant, contrat.jours_travailles,
-                 employe.revenu_mensuel, employe.id_emp))
-            conn.execute(
-                "INSERT OR REPLACE INTO adresses (employe_id, rue, ville) VALUES (?, ?, ?)",
-                (employe.id_emp, employe.adresse.rue, employe.adresse.ville))
             conn.execute("DELETE FROM affectations WHERE employe_id = ?", (employe.id_emp,))
             conn.executemany(
                 "INSERT INTO affectations (employe_id, projet_id) VALUES (?, ?)",
@@ -358,12 +373,12 @@ class Depot:
                 conn.close()
 
     def supprimer_employe(self, id_emp):
-        # Contrat, adresse (composition) et affectations disparaissent en CASCADE ;
+        # Les affectations disparaissent en CASCADE ;
         # les projets, eux, restent (agrégation).
         self._ecrire("DELETE FROM employes WHERE id = ?", (id_emp,))
 
     def lister_employes(self, recherche="", dept_filtre=None, statut=None,
-                        tri="nom", decroissant=False):
+                        projet_filtre=None, tri="nom", decroissant=False):
         if tri not in TRIS_SQL:
             raise ValueError("Colonne de tri inconnue.")
         sens = "DESC" if decroissant else "ASC"
@@ -379,16 +394,22 @@ class Depot:
                 conditions.append("e.departement_id = ?")
                 params.append(dept_filtre)
         if statut is not None:
-            conditions.append("c.type_contrat = ?")
+            conditions.append("e.type_contrat = ?")
             params.append(statut)
+        if projet_filtre is not None:
+            if projet_filtre == 0:
+                conditions.append("NOT EXISTS (SELECT 1 FROM affectations x "
+                                  "WHERE x.employe_id = e.id)")
+            else:
+                conditions.append("EXISTS (SELECT 1 FROM affectations x "
+                                  "WHERE x.employe_id = e.id AND x.projet_id = ?)")
+                params.append(projet_filtre)
 
         sql = f"""
             SELECT e.id, e.nom, e.prenom, e.email,
-                   c.type_contrat, c.montant, c.jours_travailles,
-                   d.id, d.nom, a.rue, a.ville
+                   e.type_contrat, e.montant, e.jours_travailles,
+                   d.id, d.nom, e.rue, e.ville
             FROM employes e
-            JOIN contrats c ON c.employe_id = e.id
-            LEFT JOIN adresses a ON a.employe_id = e.id
             LEFT JOIN departements d ON d.id = e.departement_id
             WHERE {" AND ".join(conditions)}
             ORDER BY {ordre}
@@ -432,33 +453,40 @@ class Depot:
 TOUS = "Tous"
 AUCUN = "(aucun)"
 
-# (clé de tri, titre affiché, largeur en caractères)
+# Palette
+FOND = "#F3F4F6"
+TEXTE = "#1F2937"
+GRIS = "#6B7280"
+BORDURE = "#D1D5DB"
+VERT, VERT_FONCE = "#2E7D32", "#256628"
+BLEU, BLEU_FONCE = "#1976D2", "#1565C0"
+ROUGE, ROUGE_FONCE = "#B71C1C", "#8E1515"
+
+# (clé de tri, titre affiché, largeur en pixels, alignement)
 COLONNES = (
-    ("id", "ID", 4),
-    ("nom", "Nom", 12),
-    ("prenom", "Prénom", 10),
-    ("email", "Email", 22),
-    ("statut", "Statut", 10),
-    ("dept", "Département", 12),
-    ("ville", "Ville", 10),
-    ("projets", "Projets", 14),
-    ("revenu", "Revenu", 20),
+    ("id", "ID", 45, "center"),
+    ("nom", "Nom", 120, "w"),
+    ("prenom", "Prénom", 110, "w"),
+    ("email", "Email", 210, "w"),
+    ("statut", "Statut", 90, "w"),
+    ("dept", "Département", 130, "w"),
+    ("rue", "Rue", 150, "w"),
+    ("ville", "Ville", 110, "w"),
+    ("projets", "Projets", 200, "w"),
+    ("revenu", "Revenu", 150, "e"),
 )
 
-
-def formater_ligne(valeurs):
-    morceaux = []
-    derniere = len(COLONNES) - 1
-    for i, (valeur, (_, _, largeur)) in enumerate(zip(valeurs, COLONNES)):
-        texte = str(valeur)[:largeur - 1]
-        morceaux.append(texte.rjust(largeur) if i == derniere else texte.ljust(largeur))
-    return "".join(morceaux)
+# Couleur du texte de la ligne selon le statut (Salarié = couleur normale)
+TAGS_STATUT = {"Freelance": "freelance", "Stagiaire": "stagiaire"}
 
 
 class Application(tk.Tk):
     def __init__(self, depot):
         super().__init__()
         self.title("Gestion du personnel")
+        self.minsize(1350, 760)
+        self.configure(background=FOND)
+        self._plein_ecran()
         self.depot = depot
         self.employes_affiches = []
         self.departements = []
@@ -470,17 +498,24 @@ class Application(tk.Tk):
 
         self.var_statut = tk.StringVar(value="Salarié")
         self.var_dept = tk.StringVar()
+        self.var_supp_dept = tk.StringVar()
+        self.var_supp_projet = tk.StringVar()
         self.var_recherche = tk.StringVar()
         self.var_filtre_dept = tk.StringVar(value=TOUS)
         self.var_filtre_statut = tk.StringVar(value=TOUS)
+        self.var_filtre_projet = tk.StringVar(value=TOUS)
 
-        self._construire_formulaire()
+        self._appliquer_style()
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        self._construire_haut()
         self._construire_liste()
-        self.lbl_message = tk.Label(self, text="", anchor="w")
-        self.lbl_message.pack(fill="x", padx=12, pady=(0, 8))
+        self._construire_barre_etat()
+        self._raccourcis()
 
         self.var_statut.trace_add("write", lambda *a: self._maj_formulaire())
-        for var in (self.var_recherche, self.var_filtre_dept, self.var_filtre_statut):
+        for var in (self.var_recherche, self.var_filtre_dept, self.var_filtre_statut,
+                    self.var_filtre_projet):
             var.trace_add("write", lambda *a: self.rafraichir_liste())
 
         self._maj_formulaire()
@@ -488,151 +523,300 @@ class Application(tk.Tk):
         self.rafraichir_projets()
         self.rafraichir_liste()
 
+    def _plein_ecran(self):
+        try:
+            self.state("zoomed")  # Windows (et certains macOS)
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)  # Linux
+            except tk.TclError:
+                self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+
+    # ----- style -----
+    def _appliquer_style(self):
+        familles = set(tkfont.families(self))
+        police = next((f for f in ("Segoe UI", "Helvetica Neue", "Ubuntu", "DejaVu Sans")
+                       if f in familles), None)
+        if police:
+            for nom in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+                tkfont.nametofont(nom).configure(family=police, size=10)
+        else:
+            police = tkfont.nametofont("TkDefaultFont").actual("family")
+        self.police = police
+
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure(".", background=FOND, foreground=TEXTE, font=(police, 10))
+
+        # Champs de saisie
+        s.configure("TEntry", fieldbackground="white", padding=4, bordercolor=BORDURE)
+        s.map("TEntry", fieldbackground=[("disabled", "#E5E7EB")],
+              foreground=[("disabled", GRIS)])
+        s.configure("TCombobox", fieldbackground="white", padding=4, bordercolor=BORDURE,
+                    arrowsize=14)
+        s.map("TCombobox", fieldbackground=[("readonly", "white")],
+              selectbackground=[("readonly", "white")],
+              selectforeground=[("readonly", TEXTE)])
+
+        # Cadres
+        s.configure("TLabelframe", background=FOND, bordercolor=BORDURE)
+        s.configure("TLabelframe.Label", background=FOND, foreground=TEXTE,
+                    font=(police, 10, "bold"))
+
+        # Boutons
+        s.configure("TButton", padding=(12, 5), background="#E5E7EB", bordercolor=BORDURE)
+        s.map("TButton", background=[("active", BORDURE)])
+
+        def bouton(nom, fond, actif):
+            s.configure(nom, background=fond, foreground="white", bordercolor=fond,
+                        padding=(16, 6))
+            s.map(nom, background=[("active", actif), ("pressed", actif)],
+                  foreground=[("active", "white")])
+
+        bouton("Accent.TButton", VERT, VERT_FONCE)      # action principale
+        bouton("Edit.TButton", BLEU, BLEU_FONCE)        # mode modification
+        bouton("DangerSolid.TButton", ROUGE, ROUGE_FONCE)
+        s.configure("Danger.TButton", background="white", foreground=ROUGE,
+                    bordercolor=ROUGE)
+        s.map("Danger.TButton", background=[("active", "#FDE8E8")],
+              foreground=[("active", ROUGE)])
+
+        # Tableau
+        s.configure("Treeview", rowheight=28, background="white", fieldbackground="white",
+                    borderwidth=0, font=(police, 10))
+        s.map("Treeview", background=[("selected", BLEU)], foreground=[("selected", "white")])
+        s.configure("Treeview.Heading", background="#E5E7EB", foreground=TEXTE,
+                    font=(police, 10, "bold"), padding=(6, 6), relief="flat")
+        s.map("Treeview.Heading", background=[("active", BORDURE)])
+
     # ----- construction -----
-    def _construire_formulaire(self):
-        self.cadre_form = tk.LabelFrame(self, padx=10, pady=8)
+    def _construire_haut(self):
+        haut = ttk.Frame(self)
+        haut.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        haut.columnconfigure(0, weight=3)
+        haut.columnconfigure(1, weight=2, minsize=400)
+        self._construire_formulaire(haut)
+
+        # Colonne de droite : gestion des départements et des projets
+        droite = ttk.Frame(haut)
+        droite.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        droite.columnconfigure(0, weight=1)
+        droite.rowconfigure(0, weight=1)
+        droite.rowconfigure(1, weight=1)
+        self.ent_nouveau_dept, self.menu_supp_dept = self._bloc_gestion(
+            droite, 0, "Départements", self.var_supp_dept,
+            self.action_creer_dept, self.action_supprimer_dept)
+        self.ent_nouveau_projet, self.menu_supp_projet = self._bloc_gestion(
+            droite, 1, "Projets", self.var_supp_projet,
+            self.action_creer_projet, self.action_supprimer_projet)
+
+    def _bloc_gestion(self, parent, ligne, titre, var_choix, creer, supprimer):
+        """Bloc « Créer / Supprimer » : retourne (champ de saisie, liste déroulante)."""
+        bloc = ttk.LabelFrame(parent, text=f" {titre} ", padding=10)
+        bloc.grid(row=ligne, column=0, sticky="nsew", pady=(0, 6) if ligne == 0 else 0)
+        bloc.columnconfigure(1, weight=1)
+
+        ttk.Label(bloc, text="Nouveau").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        entree = ttk.Entry(bloc)
+        entree.grid(row=0, column=1, sticky="ew", pady=4)
+        entree.bind("<Return>", lambda e: creer())
+        ttk.Button(bloc, text="Créer", command=creer).grid(
+            row=0, column=2, sticky="ew", padx=(8, 0))
+
+        ttk.Label(bloc, text="Existant").grid(row=1, column=0, sticky="w", padx=(0, 10))
+        choix = self._combo(bloc, var_choix, ())
+        choix.grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Button(bloc, text="Supprimer", style="Danger.TButton", command=supprimer).grid(
+            row=1, column=2, sticky="ew", padx=(8, 0))
+        return entree, choix
+
+    def _construire_formulaire(self, parent):
+        self.cadre_form = ttk.LabelFrame(parent, padding=12)
         cadre = self.cadre_form
-        cadre.pack(fill="x", padx=12, pady=8)
+        cadre.grid(row=0, column=0, sticky="nsew")
+        # colonnes de champs de même largeur ; colonne des libellés à largeur fixe
+        cadre.columnconfigure(0, minsize=60)
+        cadre.columnconfigure(1, weight=1, uniform="champ")
+        cadre.columnconfigure(2, minsize=220)
+        cadre.columnconfigure(3, weight=1, uniform="champ")
 
-        self.ent_nom = self._champ(cadre, "Nom :", 0, 0)
-        self.ent_prenom = self._champ(cadre, "Prénom :", 0, 2)
-        self.ent_email = self._champ(cadre, "Email :", 1, 0)
+        self.ent_nom = self._champ(cadre, "Nom *", 0, 0)
+        self.ent_prenom = self._champ(cadre, "Prénom *", 0, 2)
+        self.ent_email = self._champ(cadre, "Email *", 1, 0)
 
-        tk.Label(cadre, text="Département :").grid(row=1, column=2, sticky="w")
-        self.menu_dept = tk.OptionMenu(cadre, self.var_dept, "")
-        self.menu_dept.grid(row=1, column=3, sticky="ew", padx=5, pady=2)
+        self._etiquette(cadre, "Département", 1, 2)
+        self.menu_dept = self._combo(cadre, self.var_dept, ())
+        self.menu_dept.grid(row=1, column=3, sticky="ew", pady=4)
 
-        tk.Label(cadre, text="Statut :").grid(row=2, column=0, sticky="w")
-        tk.OptionMenu(cadre, self.var_statut, *TYPES_EMPLOYES.keys()).grid(
-            row=2, column=1, sticky="ew", padx=5, pady=2)
+        self._etiquette(cadre, "Statut", 2, 0)
+        self._combo(cadre, self.var_statut, list(TYPES_EMPLOYES)).grid(
+            row=2, column=1, sticky="ew", pady=4)
 
-        self.lbl_montant = tk.Label(cadre, text="Salaire mensuel (€) :")
-        self.lbl_montant.grid(row=2, column=2, sticky="w")
-        self.ent_montant = tk.Entry(cadre)
-        self.ent_montant.grid(row=2, column=3, padx=5, pady=2)
+        self.lbl_montant = self._etiquette(cadre, "Salaire mensuel (€) *", 2, 2)
+        self.ent_montant = ttk.Entry(cadre)
+        self.ent_montant.grid(row=2, column=3, sticky="ew", pady=4)
 
-        self.ent_rue = self._champ(cadre, "Rue :", 3, 0)
-        tk.Label(cadre, text="Jours travaillés :").grid(row=3, column=2, sticky="w")
-        self.ent_jours = tk.Entry(cadre)
-        self.ent_jours.grid(row=3, column=3, padx=5, pady=2)
+        self.ent_rue = self._champ(cadre, "Rue", 3, 0)
+        self.lbl_jours = self._etiquette(cadre, "Jours travaillés", 3, 2)
+        self.ent_jours = ttk.Entry(cadre)
+        self.ent_jours.grid(row=3, column=3, sticky="ew", pady=4)
 
-        self.ent_ville = self._champ(cadre, "Ville :", 4, 0)
-        tk.Label(cadre, text="Projets :").grid(row=4, column=2, sticky="nw")
-        self.liste_projets = tk.Listbox(cadre, selectmode=tk.MULTIPLE, height=3,
-                                        exportselection=False)
-        self.liste_projets.grid(row=4, column=3, sticky="ew", padx=5, pady=2)
+        self.ent_ville = self._champ(cadre, "Ville", 4, 0)
+        self._etiquette(cadre, "Projets", 4, 2, sticky="nw", pady=8)
+        cadre_proj = ttk.Frame(cadre)
+        cadre_proj.grid(row=4, column=3, rowspan=2, sticky="ew", pady=4)
+        cadre_proj.columnconfigure(0, weight=1)
+        self.liste_projets = tk.Listbox(
+            cadre_proj, selectmode=tk.MULTIPLE, height=4, exportselection=False,
+            activestyle="none", bg="white", fg=TEXTE, relief="flat",
+            highlightthickness=1, highlightbackground="#B8BEC7", highlightcolor=BLEU,
+            selectbackground=BLEU, selectforeground="white", font=(self.police, 10))
+        ascenseur = ttk.Scrollbar(cadre_proj, orient="vertical",
+                                  command=self.liste_projets.yview)
+        self.liste_projets.config(yscrollcommand=ascenseur.set)
+        self.liste_projets.grid(row=0, column=0, sticky="ew")
+        ascenseur.grid(row=0, column=1, sticky="ns")
 
-        boutons = tk.Frame(cadre)
-        boutons.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        self.btn_valider = tk.Button(boutons, fg="white", command=self.action_valider)
-        self.btn_valider.pack(side="left", fill="x", expand=True)
-        self.btn_annuler = tk.Button(boutons, text="Annuler", command=self._mode_ajout)
-
-        # Gestion des départements
-        cadre_d = tk.LabelFrame(self, text=" Départements ", padx=10, pady=6)
-        cadre_d.pack(fill="x", padx=12, pady=4)
-        self.ent_nouveau_dept = tk.Entry(cadre_d)
-        self.ent_nouveau_dept.pack(side="left", padx=(0, 5))
-        tk.Button(cadre_d, text="Créer", command=self.action_creer_dept).pack(side="left")
-        tk.Button(cadre_d, text="Supprimer le département choisi ci-dessus", fg="#B71C1C",
-                  command=self.action_supprimer_dept).pack(side="right")
-
-        # Gestion des projets
-        cadre_p = tk.LabelFrame(self, text=" Projets ", padx=10, pady=6)
-        cadre_p.pack(fill="x", padx=12, pady=4)
-        self.ent_nouveau_projet = tk.Entry(cadre_p)
-        self.ent_nouveau_projet.pack(side="left", padx=(0, 5))
-        tk.Button(cadre_p, text="Créer", command=self.action_creer_projet).pack(side="left")
-        tk.Button(cadre_p, text="Supprimer le projet sélectionné ci-dessus", fg="#B71C1C",
-                  command=self.action_supprimer_projet).pack(side="right")
+        boutons = ttk.Frame(cadre)
+        boutons.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        self.btn_valider = ttk.Button(boutons, command=self.action_valider)
+        self.btn_valider.pack(side="left")
+        self.btn_annuler = ttk.Button(boutons, text="Annuler", command=self._mode_ajout)
+        ttk.Label(boutons, text="* champ obligatoire", foreground=GRIS).pack(side="right")
 
         self._mode_ajout()
 
+    @staticmethod
+    def _etiquette(parent, texte, ligne, colonne, sticky="w", pady=4):
+        etiquette = ttk.Label(parent, text=texte)
+        etiquette.grid(row=ligne, column=colonne, sticky=sticky, pady=pady,
+                       padx=(16 if colonne else 0, 8))
+        return etiquette
+
     def _champ(self, parent, texte, ligne, colonne):
-        tk.Label(parent, text=texte).grid(row=ligne, column=colonne, sticky="w")
-        entree = tk.Entry(parent)
-        entree.grid(row=ligne, column=colonne + 1, padx=5, pady=2)
+        self._etiquette(parent, texte, ligne, colonne)
+        entree = ttk.Entry(parent)
+        entree.grid(row=ligne, column=colonne + 1, sticky="ew", pady=4)
         return entree
 
+    @staticmethod
+    def _combo(parent, variable, valeurs, width=None):
+        options = {"textvariable": variable, "values": list(valeurs), "state": "readonly"}
+        if width:
+            options["width"] = width
+        return ttk.Combobox(parent, **options)
+
     def _construire_liste(self):
-        self.cadre_liste = tk.LabelFrame(self, padx=10, pady=8)
+        self.cadre_liste = ttk.LabelFrame(self, padding=10)
         cadre = self.cadre_liste
-        cadre.pack(fill="both", expand=True, padx=12, pady=8)
+        cadre.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+        cadre.columnconfigure(0, weight=1)
+        cadre.rowconfigure(1, weight=1)
 
         # Ligne de recherche et de filtres
-        haut = tk.Frame(cadre)
-        haut.pack(fill="x")
-        tk.Label(haut, text="Recherche :").pack(side="left")
-        tk.Entry(haut, textvariable=self.var_recherche, width=16).pack(side="left", padx=5)
-        tk.Label(haut, text="Dép. :").pack(side="left")
-        self.menu_filtre_dept = tk.OptionMenu(haut, self.var_filtre_dept, TOUS)
-        self.menu_filtre_dept.pack(side="left", padx=5)
-        tk.Label(haut, text="Statut :").pack(side="left")
-        tk.OptionMenu(haut, self.var_filtre_statut, TOUS, *TYPES_EMPLOYES.keys()).pack(
-            side="left", padx=5)
-        tk.Button(haut, text="Supprimer la sélection", fg="#B71C1C",
-                  command=self.action_supprimer).pack(side="right")
+        barre = ttk.Frame(cadre)
+        barre.grid(row=0, column=0, sticky="ew")
+        ttk.Label(barre, text="Recherche").pack(side="left")
+        ttk.Entry(barre, textvariable=self.var_recherche, width=22).pack(
+            side="left", padx=(6, 18))
+        ttk.Label(barre, text="Département").pack(side="left")
+        self.menu_filtre_dept = self._combo(barre, self.var_filtre_dept, [TOUS], width=14)
+        self.menu_filtre_dept.pack(side="left", padx=(6, 18))
+        ttk.Label(barre, text="Statut").pack(side="left")
+        self._combo(barre, self.var_filtre_statut, [TOUS, *TYPES_EMPLOYES], width=11).pack(
+            side="left", padx=(6, 18))
+        ttk.Label(barre, text="Projet").pack(side="left")
+        self.menu_filtre_projet = self._combo(barre, self.var_filtre_projet, [TOUS], width=14)
+        self.menu_filtre_projet.pack(side="left", padx=(6, 0))
+        ttk.Button(barre, text="Supprimer la sélection", style="Danger.TButton",
+                   command=self.action_supprimer).pack(side="right")
 
-        # En-têtes cliquables = tri par colonne
-        entete = tk.Frame(cadre)
-        entete.pack(fill="x", pady=(8, 0))
-        self.boutons_tri = []
-        for i, (cle, titre, largeur) in enumerate(COLONNES):
-            bouton = tk.Button(entete, width=largeur, anchor="w", relief="flat", bd=0,
-                               padx=0, pady=0, highlightthickness=0,
-                               font=("Courier", 10, "bold"),
+        corps = ttk.Frame(cadre)
+        corps.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        corps.columnconfigure(0, weight=1)
+        corps.rowconfigure(0, weight=1)
+        ascenseur = ttk.Scrollbar(corps, orient="vertical")
+        ascenseur.grid(row=0, column=1, sticky="ns")
+
+        self.liste = ttk.Treeview(corps, columns=[c[0] for c in COLONNES],
+                                  show="headings", selectmode="browse", height=8,
+                                  yscrollcommand=ascenseur.set)
+        for i, (cle, titre, largeur, ancre) in enumerate(COLONNES):
+            self.liste.heading(cle, text=titre, anchor=ancre,
                                command=lambda i=i: self.action_trier(i))
-            bouton.pack(side="left")
-            self.boutons_tri.append(bouton)
-        self._maj_entetes()
-
-        corps = tk.Frame(cadre)
-        corps.pack(fill="both", expand=True)
-        barre = tk.Scrollbar(corps)
-        barre.pack(side="right", fill="y")
-        self.liste = tk.Listbox(corps, font=("Courier", 10), height=10, exportselection=False,
-                                width=sum(c[2] for c in COLONNES), yscrollcommand=barre.set)
-        self.liste.pack(side="left", fill="both", expand=True)
-        barre.config(command=self.liste.yview)
+            # largeur fixe : seule la colonne « Projets » s'étire si on agrandit la fenêtre
+            self.liste.column(cle, width=largeur, minwidth=largeur, anchor=ancre,
+                              stretch=(cle == "projets"))
+        self.liste.grid(row=0, column=0, sticky="nsew")
+        ascenseur.config(command=self.liste.yview)
         self.liste.bind("<Double-Button-1>", self.action_charger)
 
-        tk.Label(cadre, text="Double-clic sur une ligne pour la modifier. "
-                             "Clic sur un titre de colonne pour trier.",
-                 fg="#666666").pack(anchor="w", pady=(4, 0))
+        # Lignes en alternance + couleur du texte selon le statut
+        self.liste.tag_configure("pair", background="white")
+        self.liste.tag_configure("impair", background="#F3F6FA")
+        self.liste.tag_configure("freelance", foreground="#B45309")
+        self.liste.tag_configure("stagiaire", foreground=GRIS)
+
+        # Message affiché quand la liste est vide
+        self.lbl_vide = ttk.Label(self.liste, background="white", foreground=GRIS,
+                                  font=(self.police, 11))
+        self._maj_entetes()
+
+        ttk.Label(cadre, foreground=GRIS,
+                  text="Double-clic : modifier   •   Suppr : supprimer la ligne   •   "
+                       "Clic sur un titre : trier").grid(row=2, column=0, sticky="w",
+                                                         pady=(8, 0))
+
+    def _construire_barre_etat(self):
+        self.lbl_message = ttk.Label(self, anchor="w", padding=(14, 8))
+        self.lbl_message.grid(row=2, column=0, sticky="ew")
+        self.message("Prêt.", info=True)
+
+    def _raccourcis(self):
+        # Entrée : valider le formulaire
+        for champ in (self.ent_nom, self.ent_prenom, self.ent_email, self.ent_montant,
+                      self.ent_rue, self.ent_ville, self.ent_jours):
+            champ.bind("<Return>", lambda e: self.action_valider())
+        # Suppr : supprimer la ligne sélectionnée
+        self.liste.bind("<Delete>", lambda e: self.action_supprimer())
+        # Échap : quitter le mode modification
+        self.bind("<Escape>", lambda e: self._mode_ajout() if self.employe_en_edition else None)
 
     # ----- affichage -----
-    def message(self, texte, erreur=False):
-        self.lbl_message.config(text=texte, fg="#B71C1C" if erreur else "#2E7D32")
+    def message(self, texte, erreur=False, info=False):
+        if erreur:
+            fond, couleur = "#FDE8E8", ROUGE
+        elif info:
+            fond, couleur = "#E8F0FE", "#1A4E9C"
+        else:
+            fond, couleur = "#E6F4EA", "#1E6B34"
+        self.lbl_message.config(text=texte, background=fond, foreground=couleur)
 
     def _maj_formulaire(self):
         """Adapte le formulaire au statut choisi."""
         statut = self.var_statut.get()
         if statut == "Freelance":
-            self.lbl_montant.config(text="Tarif journalier (TJM €) :")
+            self.lbl_montant.config(text="Tarif journalier (TJM €) *")
+            self.lbl_jours.config(text="Jours travaillés *")
             self.ent_jours.config(state="normal")
             if not self.ent_jours.get():
                 self.ent_jours.insert(0, "20")
         else:
             if statut == "Stagiaire":
-                self.lbl_montant.config(text="Gratification (€) :")
+                self.lbl_montant.config(text="Gratification (€) *")
             else:
-                self.lbl_montant.config(text="Salaire mensuel (€) :")
+                self.lbl_montant.config(text="Salaire mensuel (€) *")
+            self.lbl_jours.config(text="Jours travaillés")
+            self.ent_jours.config(state="normal")
             self.ent_jours.delete(0, tk.END)
             self.ent_jours.config(state="disabled")
 
     def _maj_entetes(self):
-        for i, (cle, titre, _) in enumerate(COLONNES):
+        for i, (cle, titre, _, _) in enumerate(COLONNES):
             fleche = ""
             if i == self.tri_col:
-                fleche = "▼" if self.tri_desc else "▲"
-            self.boutons_tri[i].config(text=titre + fleche)
-
-    @staticmethod
-    def _reconstruire_menu(menu_widget, variable, choix):
-        menu = menu_widget["menu"]
-        menu.delete(0, "end")
-        for texte in choix:
-            menu.add_command(label=texte, command=lambda t=texte: variable.set(t))
+                fleche = " ▼" if self.tri_desc else " ▲"
+            self.liste.heading(cle, text=titre + fleche)
 
     def rafraichir_departements(self):
         try:
@@ -642,17 +826,20 @@ class Application(tk.Tk):
             return
         noms = [d.nom for d in self.departements]
 
-        self._reconstruire_menu(self.menu_dept, self.var_dept, [AUCUN] + noms)
+        self.menu_dept.config(values=[AUCUN] + noms)
         if self.var_dept.get() not in noms + [AUCUN]:
             self.var_dept.set(noms[0] if noms else AUCUN)
 
-        self._reconstruire_menu(self.menu_filtre_dept, self.var_filtre_dept,
-                                [TOUS, AUCUN] + noms)
+        self.menu_supp_dept.config(values=noms)
+        if self.var_supp_dept.get() not in noms:
+            self.var_supp_dept.set(noms[0] if noms else "")
+
+        self.menu_filtre_dept.config(values=[TOUS, AUCUN] + noms)
         if self.var_filtre_dept.get() not in noms + [TOUS, AUCUN]:
             self.var_filtre_dept.set(TOUS)
 
     def _projets_choisis(self):
-        """Objets Projet sélectionnés dans le Listbox du formulaire."""
+        """Objets Projet sélectionnés dans la liste du formulaire."""
         return [self.projets[i] for i in self.liste_projets.curselection()]
 
     def rafraichir_projets(self):
@@ -668,6 +855,15 @@ class Application(tk.Tk):
             if projet.nom in noms_choisis:
                 self.liste_projets.selection_set(i)
 
+        noms = [p.nom for p in self.projets]
+        self.menu_supp_projet.config(values=noms)
+        if self.var_supp_projet.get() not in noms:
+            self.var_supp_projet.set(noms[0] if noms else "")
+
+        self.menu_filtre_projet.config(values=[TOUS, AUCUN] + noms)
+        if self.var_filtre_projet.get() not in noms + [TOUS, AUCUN]:
+            self.var_filtre_projet.set(TOUS)
+
     def _id_dept_par_nom(self, nom):
         return next((d.id_dept for d in self.departements if d.nom == nom), None)
 
@@ -679,13 +875,23 @@ class Application(tk.Tk):
             return 0
         return self._id_dept_par_nom(valeur)
 
+    def _projet_filtre(self):
+        valeur = self.var_filtre_projet.get()
+        if valeur == TOUS:
+            return None
+        if valeur == AUCUN:
+            return 0
+        return next((p.id_projet for p in self.projets if p.nom == valeur), None)
+
     def rafraichir_liste(self):
         statut = self.var_filtre_statut.get()
+        recherche = self.var_recherche.get().strip()
         try:
             employes = self.depot.lister_employes(
-                self.var_recherche.get().strip(),
+                recherche,
                 self._dept_filtre(),
                 None if statut == TOUS else statut,
+                self._projet_filtre(),
                 COLONNES[self.tri_col][0],
                 self.tri_desc)
         except (ValueError, sqlite3.Error) as e:
@@ -693,14 +899,26 @@ class Application(tk.Tk):
             return
         self.employes_affiches = employes
 
-        self.liste.delete(0, tk.END)
-        for emp in employes:
+        self.liste.delete(*self.liste.get_children())
+        for i, emp in enumerate(employes):
             dept = emp.departement.nom if emp.departement else AUCUN
             projets = ", ".join(p.nom for p in emp.projets)
-            self.liste.insert(tk.END, formater_ligne((
+            tags = ["impair" if i % 2 else "pair"]
+            if emp.contrat.type_contrat in TAGS_STATUT:
+                tags.append(TAGS_STATUT[emp.contrat.type_contrat])
+            self.liste.insert("", tk.END, iid=str(i), tags=tags, values=(
                 emp.id_emp, emp.nom, emp.prenom, emp.email, emp.contrat.type_contrat,
-                dept, emp.adresse.ville, projets, emp.revenu_affiche)))
-        self.cadre_liste.config(text=f" Personnel ({len(self.employes_affiches)}) ")
+                dept, emp.adresse.rue, emp.adresse.ville, projets, emp.revenu_affiche))
+        self.cadre_liste.config(text=f" Personnel ({len(employes)}) ")
+
+        if employes:
+            self.lbl_vide.place_forget()
+        else:
+            filtre_actif = (recherche or statut != TOUS or self.var_filtre_dept.get() != TOUS
+                            or self.var_filtre_projet.get() != TOUS)
+            self.lbl_vide.config(text="Aucun résultat pour ces critères." if filtre_actif
+                                 else "Aucun collaborateur pour l'instant.")
+            self.lbl_vide.place(relx=0.5, rely=0.3, anchor="center")
 
     # ----- mode ajout / mode modification -----
     def _vider_formulaire(self):
@@ -715,22 +933,20 @@ class Application(tk.Tk):
     def _mode_ajout(self):
         self.employe_en_edition = None
         self.cadre_form.config(text=" Nouveau collaborateur ")
-        self.btn_valider.config(text="Ajouter le collaborateur", bg="#4CAF50")
+        self.btn_valider.config(text="Ajouter le collaborateur", style="Accent.TButton")
         self.btn_annuler.pack_forget()
         self._vider_formulaire()
 
     def action_charger(self, event):
         """Double-clic : charge l'employé dans le formulaire."""
-        i = self.liste.nearest(event.y)
-        boite = self.liste.bbox(i)
-        if not (0 <= i < len(self.employes_affiches)) or boite is None \
-                or not (boite[1] <= event.y < boite[1] + boite[3]):
+        ligne = self.liste.identify_row(event.y)
+        if not ligne:  # clic sur l'en-tête ou dans le vide
             return
-        emp = self.employes_affiches[i]
+        emp = self.employes_affiches[int(ligne)]
         self.employe_en_edition = emp
         self.cadre_form.config(text=f" Modifier : {emp.prenom} {emp.nom} ")
-        self.btn_valider.config(text="Enregistrer les modifications", bg="#1976D2")
-        self.btn_annuler.pack(side="right", padx=(8, 0))
+        self.btn_valider.config(text="Enregistrer les modifications", style="Edit.TButton")
+        self.btn_annuler.pack(side="left", padx=(8, 0))
 
         for champ, valeur in ((self.ent_nom, emp.nom), (self.ent_prenom, emp.prenom),
                               (self.ent_email, emp.email),
@@ -750,7 +966,8 @@ class Application(tk.Tk):
         for k, projet in enumerate(self.projets):
             if projet.id_projet in ids_projets:
                 self.liste_projets.selection_set(k)
-        self.message("Modifiez les champs puis enregistrez (ou Annuler).")
+        self.message("Modifiez les champs puis enregistrez (Entrée) ou annulez (Échap).",
+                     info=True)
 
     # ----- actions -----
     def action_valider(self):
@@ -799,6 +1016,7 @@ class Application(tk.Tk):
             return
         fen = tk.Toplevel(self)
         self.fenetre_confirmation = fen
+        fen.configure(background=FOND)
         fen.title(titre)
         fen.resizable(False, False)
         fen.transient(self)  # reste au-dessus de la fenêtre principale
@@ -812,34 +1030,33 @@ class Application(tk.Tk):
             fermer()
             action()
 
-        tk.Label(fen, text=texte, justify="left", padx=20, pady=15).pack()
-        boutons = tk.Frame(fen)
-        boutons.pack(pady=(0, 12))
-        tk.Button(boutons, text="Oui, supprimer", bg="#B71C1C", fg="white",
-                  command=oui).pack(side="left", padx=6)
-        bouton_non = tk.Button(boutons, text="Non", width=10, command=fermer)
+        ttk.Label(fen, text=texte, justify="left", padding=(24, 18)).pack()
+        boutons = ttk.Frame(fen)
+        boutons.pack(pady=(0, 16))
+        ttk.Button(boutons, text="Oui, supprimer", style="DangerSolid.TButton",
+                   command=oui).pack(side="left", padx=6)
+        bouton_non = ttk.Button(boutons, text="Non", width=10, command=fermer)
         bouton_non.pack(side="left", padx=6)
         bouton_non.focus_set()  # par sécurité, « Non » est le choix par défaut
         fen.bind("<Escape>", lambda e: fermer())
         fen.protocol("WM_DELETE_WINDOW", fermer)
 
-        fen.update_idletasks()  # centrer sur la fenêtre principale
+        fen.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - fen.winfo_reqwidth()) // 2
         y = self.winfo_rooty() + (self.winfo_height() - fen.winfo_reqheight()) // 2
         fen.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         fen.wait_visibility()
-        fen.grab_set()  # modale : bloque la fenêtre principale
+        fen.grab_set()
 
     def action_supprimer(self):
-        selection = self.liste.curselection()
+        selection = self.liste.selection()
         if not selection:
             self.message("Sélectionnez d'abord un employé.", erreur=True)
             return
-        emp = self.employes_affiches[selection[0]]
+        emp = self.employes_affiches[int(selection[0])]
         self.confirmer(
             "Confirmer la suppression",
             f"Supprimer {emp.prenom} {emp.nom} ?\n\n"
-            "Son contrat et son adresse seront aussi supprimés.\n"
             "Cette action est définitive.",
             lambda: self._supprimer_employe(emp))
 
@@ -852,8 +1069,7 @@ class Application(tk.Tk):
             if self.employe_en_edition and self.employe_en_edition.id_emp == emp.id_emp:
                 self._mode_ajout()
             self.rafraichir_liste()
-            self.message(f"{emp.prenom} {emp.nom}, son contrat et son adresse "
-                         "ont été supprimés.")
+            self.message(f"{emp.prenom} {emp.nom} supprimé.")
 
     def action_creer_dept(self):
         nom = self.ent_nouveau_dept.get().strip()
@@ -870,10 +1086,10 @@ class Application(tk.Tk):
             self.message(f"Département « {nom} » créé.")
 
     def action_supprimer_dept(self):
-        nom = self.var_dept.get()
+        nom = self.var_supp_dept.get()
         id_dept = self._id_dept_par_nom(nom)
         if id_dept is None:
-            self.message("Choisissez d'abord un département dans le formulaire.", erreur=True)
+            self.message("Choisissez d'abord le département à supprimer.", erreur=True)
             return
         self.confirmer(
             "Confirmer la suppression",
@@ -893,8 +1109,8 @@ class Application(tk.Tk):
 
     def action_creer_projet(self):
         nom = self.ent_nouveau_projet.get().strip()
-        if not nom:
-            self.message("Saisissez un nom de projet.", erreur=True)
+        if not nom or nom in (TOUS, AUCUN):
+            self.message("Saisissez un nom de projet valide.", erreur=True)
             return
         try:
             self.depot.ajouter_projet(nom)
@@ -906,12 +1122,11 @@ class Application(tk.Tk):
             self.message(f"Projet « {nom} » créé.")
 
     def action_supprimer_projet(self):
-        choisis = self._projets_choisis()
-        if len(choisis) != 1:
-            self.message("Sélectionnez un seul projet dans la liste « Projets » du "
-                         "formulaire.", erreur=True)
+        nom = self.var_supp_projet.get()
+        projet = next((p for p in self.projets if p.nom == nom), None)
+        if projet is None:
+            self.message("Choisissez d'abord le projet à supprimer.", erreur=True)
             return
-        projet = choisis[0]
         self.confirmer(
             "Confirmer la suppression",
             f"Supprimer le projet « {projet.nom} » ?\n\n"
